@@ -455,3 +455,299 @@ half3 GetImageBasedReflectionLighting(FMaterialPixelParameters MaterialParameter
 {
 	return GetImageBasedReflectionLighting(MaterialParameters, Roughness, SpecularColor, IndirectIrradiance, GridIndex, SingleCaptureIndex, 0);
 }
+
+// BEGIN Engine Change [LightSmuggler]: Adding in our light retriever code
+// NOTE: Putting it here works?
+#include "LightSmuggler/LightSmugglerCommon.ush"
+
+// idk why was running into issues calling GetShadowTerms, but its the surface shadow term I only use so just gonna get that directly
+float GetSmuggledSurfaceShadow(FGBufferData GBuffer, FDeferredLightData LightData, float3 WorldPosition, float3 L, float4 LightAttenuation)
+{
+	float SurfaceShadow = 1.f;
+	float Dither = 1.f;
+	float ContactShadowLength = 0.0f;
+	const float ContactShadowLengthScreenScale = View.ClipToView[1][1] * GBuffer.Depth;
+
+	BRANCH
+	if (LightData.ShadowedBits)
+	{
+		// Remapping the light attenuation buffer (see ShadowRendering.cpp)
+
+		// LightAttenuation: Light function + per-object shadows in z, per-object SSS shadowing in w, 
+		// Whole scene directional light shadows in x, whole scene directional light SSS shadows in y
+		// Get static shadowing from the appropriate GBuffer channel
+		float UsesStaticShadowMap = dot(LightData.ShadowMapChannelMask, float4(1, 1, 1, 1));
+		float StaticShadowing = lerp(1, dot(GBuffer.PrecomputedShadowFactors, LightData.ShadowMapChannelMask), UsesStaticShadowMap);
+
+		if (LightData.bRadialLight)
+		{
+			SurfaceShadow = LightAttenuation.z * StaticShadowing;
+		}
+		else
+		{
+			// Remapping the light attenuation buffer (see ShadowRendering.cpp)
+			// Also fix up the fade between dynamic and static shadows
+			// to work with plane splits rather than spheres.
+
+			float DynamicShadowFraction = DistanceFromCameraFade(GBuffer.Depth, LightData, WorldPosition, View.WorldCameraOrigin);
+			// For a directional light, fade between static shadowing and the whole scene dynamic shadowing based on distance + per object shadows
+			SurfaceShadow = lerp(LightAttenuation.x, StaticShadowing, DynamicShadowFraction);
+			SurfaceShadow *= LightAttenuation.z;
+		}
+
+		FLATTEN
+		if (LightData.ShadowedBits > 1 && LightData.ContactShadowLength > 0)
+		{
+			ContactShadowLength = LightData.ContactShadowLength * (LightData.ContactShadowLengthInWS ? 1.0f : ContactShadowLengthScreenScale);
+		}
+	}
+
+#if SUPPORT_CONTACT_SHADOWS
+	if (LightData.ShadowedBits < 2 && (GBuffer.ShadingModelID == SHADINGMODELID_HAIR))
+	{
+		ContactShadowLength = 0.2 * ContactShadowLengthScreenScale;
+	}
+	// World space distance to cover eyelids and eyelashes but not beyond
+	if (GBuffer.ShadingModelID == SHADINGMODELID_EYE)
+	{
+		ContactShadowLength = 0.5;
+		
+	}
+
+	#if MATERIAL_CONTACT_SHADOWS
+		ContactShadowLength = 0.2 * ContactShadowLengthScreenScale;
+	#endif
+
+	BRANCH
+	if (ContactShadowLength > 0.0)
+	{
+		float StepOffset = Dither - 0.5;
+		bool bHitCastContactShadow = false;
+		float HitDistance = ShadowRayCast( WorldPosition + View.PreViewTranslation, L, ContactShadowLength, 8, StepOffset, bHitCastContactShadow );
+				
+		if ( HitDistance > 0.0 )
+		{
+			float ContactShadowOcclusion = bHitCastContactShadow ? 1.0 : LightData.ContactShadowNonShadowCastingIntensity;
+
+			// Exponential attenuation is not applied on hair/eye/SSS-profile here, as the hit distance (shading-point to blocker) is different from the estimated 
+			// thickness (closest-point-from-light to shading-point), and this creates light leaks. Instead we consider first hit as a blocker (old behavior)
+			BRANCH
+			if (ContactShadowOcclusion > 0.0 && 
+				IsSubsurfaceModel(GBuffer.ShadingModelID) && 
+				GBuffer.ShadingModelID != SHADINGMODELID_HAIR && 
+				GBuffer.ShadingModelID != SHADINGMODELID_EYE && 
+				GBuffer.ShadingModelID != SHADINGMODELID_SUBSURFACE_PROFILE)
+			{
+				// Reduce the intensity of the shadow similar to the subsurface approximation used by the shadow maps path
+				// Note that this is imperfect as we don't really have the "nearest occluder to the light", but this should at least
+				// ensure that we don't darken-out the subsurface term with the contact shadows
+				float Opacity = GBuffer.CustomData.a;
+				float Density = SubsurfaceDensityFromOpacity( Opacity );
+				ContactShadowOcclusion *= 1.0 - saturate( exp( -Density * HitDistance ) );
+			}
+
+			float ContactShadow = 1.0 - ContactShadowOcclusion;
+
+			SurfaceShadow *= ContactShadow;
+		}
+		
+	}
+#endif
+
+	return SurfaceShadow;
+}
+
+// What goes on in here is equivalent to a call to AccumulateDynamicLighting in terms of the light terms it gets
+FSmuggledLight ConvertDeferredToSmuggled(FMaterialPixelParameters MaterialParameters, FDeferredLightData InLightData, half4 LightAttenuation, FGBufferData GBuffer, float3 TranslatedWorldPosition)
+{
+	// All 'emtpy' fields are stuff we need to pass into here
+	float3 V = -MaterialParameters.CameraVector; // For N, we're not gonna be able to account for normal maps here (if thats even necessary), just geometry normal
+	float3 N = MaterialParameters.WorldNormal;
+
+	///////////////////////////////
+	FSmuggledLight SmuggledLight;
+	//SmuggledLight.Light = InLightData;
+
+	// Setup light
+	float3 L = InLightData.Direction;
+	float3 ToLight = L;
+	SmuggledLight.Attenuation = 1;
+
+	if (InLightData.bRadialLight)
+	{
+		SmuggledLight.Attenuation = GetLocalLightAttenuation(TranslatedWorldPosition, InLightData, ToLight, L);
+	}
+
+	BRANCH
+	if (SmuggledLight.Attenuation > 0) // Should this light even be considered from attenuation?
+	{
+		// Shadows
+		SmuggledLight.Shadow = GetSmuggledSurfaceShadow(GBuffer, InLightData, TranslatedWorldPosition, L, LightAttenuation);
+		// We only care about the SurfaceShadow term in ShadowTerms btw
+
+		// No rect light so only capsule shadow
+		//FAreaLight AreaLight;
+
+		FCapsuleLight Capsule = GetCapsule(ToLight, InLightData); // no rect lights in forward
+		float IntegratedFalloff = IntegrateLight(Capsule, InLightData.FalloffExponent == 0);
+		//AreaLight = Context.AreaLight;
+
+		// Account for light function
+		#if USE_LIGHT_FUNCTION_ATLAS
+		SmuggledLight.Attenuation *= GetLocalLightFunctionCommon(TranslatedWorldPosition, LightData.LightFunctionAtlasLightIndex);
+		#endif
+
+		{
+			SmuggledLight.L = ToLight;
+			SmuggledLight.Attenuation *= IntegratedFalloff;
+			SmuggledLight.Color = InLightData.Color;
+			SmuggledLight.SpecularScale = InLightData.SpecularScale;
+		}
+
+	}
+
+	return SmuggledLight;
+}
+
+FDeferredLightData ConvertToDeferredLight(FLocalLightData LocalLight)
+{
+	FDeferredLightData LightData = (FDeferredLightData)0;
+		LightData.Position = LocalLight.LightPositionAndInvRadius.xyz;
+		LightData.InvRadius = LocalLight.LightPositionAndInvRadius.w;
+		LightData.Color = LocalLight.LightColorAndFalloffExponent.xyz;
+		LightData.FalloffExponent = LocalLight.LightColorAndFalloffExponent.w;
+		LightData.Direction = LocalLight.LightDirectionAndShadowMask.xyz;
+		LightData.SpotAngles = LocalLight.SpotAnglesAndSourceRadiusPacked.xy;
+		LightData.SourceRadius = LocalLight.SpotAnglesAndSourceRadiusPacked.z;
+		LightData.SourceLength = f16tof32(asuint(LocalLight.SpotAnglesAndSourceRadiusPacked.w));
+        LightData.Tangent = LocalLight.LightTangentAndSoftSourceRadius.xyz;
+        LightData.SoftSourceRadius = LocalLight.LightTangentAndSoftSourceRadius.w;
+		LightData.bInverseSquared = LightData.FalloffExponent == 0;
+		LightData.bRadialLight = true;
+		LightData.bSpotLight = LightData.SpotAngles.x > -2.0f;
+		LightData.SpecularScale = 1.f;
+
+	return LightData;
+}
+
+void ConvertDirectLightToSmuggled(FMaterialPixelParameters MaterialParameters, FGBufferData GBufferData, uint LightingChannelMask, float4 DynamicShadowFactors, uint EyeIndex, float3 TranslatedWorldPosition)
+{
+	const FDirectionalLightData DirectionalLightData = GetDirectionalLightData(EyeIndex);
+
+	LightSmugglePack.bHasDirectionalLight = false;
+
+	BRANCH
+	if (DirectionalLightData.HasDirectionalLight)
+	{
+		FDeferredLightData LightData = (FDeferredLightData)0;
+		{ 
+			// Converting from directional light to deferred light data
+			LightData.Color = DirectionalLightData.DirectionalLightColor;
+			LightData.FalloffExponent = 0;
+			LightData.Direction = DirectionalLightData.DirectionalLightDirection;
+			LightData.DistanceFadeMAD = DirectionalLightData.DirectionalLightDistanceFadeMAD;
+			LightData.bRadialLight = false;
+
+			LightData.ShadowedBits = (DirectionalLightData.DirectionalLightShadowMapChannelMask & 0xFF) != 0 ? 1 : 0;
+			// Static shadowing uses ShadowMapChannel, dynamic shadows are packed into light attenuation using PreviewShadowMapChannel
+			LightData.ShadowMapChannelMask = UnpackShadowMapChannelMask(DirectionalLightData.DirectionalLightShadowMapChannelMask);
+		}
+
+		// Directional Light Shadow Factors
+#if (MATERIALBLENDING_SOLID || MATERIALBLENDING_MASKED)
+			// NOTE: This differs based on blend mode, below is only for solid/masked (shadows not cast onto translucency i think)
+			float4 PreviewShadowMapChannelMask = UnpackShadowMapChannelMask(DirectionalLightData.DirectionalLightShadowMapChannelMask >> 4);
+			float DynamicShadowing = dot(PreviewShadowMapChannelMask, DynamicShadowFactors);
+
+			// In the forward shading path we can't separate per-object shadows from CSM, since we only spend one light attenuation channel per light
+			// If CSM is enabled (distance fading to precomputed shadowing is active), treat all of our dynamic shadowing as whole scene shadows that will be faded out at the max CSM distance
+			// If CSM is not enabled, allow our dynamic shadowing to coexist with precomputed shadowing
+			float PerObjectShadowing = LightData.DistanceFadeMAD.y < 0.0f ? 1.0f : DynamicShadowing;
+			float WholeSceneShadowing = LightData.DistanceFadeMAD.y < 0.0f ? DynamicShadowing : 1.0f;
+
+			float4 LightAttenuation = float4(WholeSceneShadowing.xx, PerObjectShadowing.xx);
+#else 
+
+			LightData.ShadowedBits = 1;
+			LightData.ShadowMapChannelMask.x = 1;
+			#if TRANSLUCENCY_LIGHTING_SURFACE_FORWARDSHADING
+				GBufferData.PrecomputedShadowFactors.x = ComputeDirectionalLightStaticShadowing(TranslatedWorldPosition).x;
+			#else
+				GBufferData.PrecomputedShadowFactors.x = 1;
+			#endif
+			float DynamicShadowFactor = ComputeDirectionalLightDynamicShadowing(TranslatedWorldPosition, GBufferData.Depth);
+
+			float4 LightAttenuation = float4(DynamicShadowFactor.x, DynamicShadowFactor.x, 1, 1);
+#endif
+
+		// Rest of it is the same so we just pass it in there to handle it
+		LightSmugglePack.DirectionalLight = ConvertDeferredToSmuggled(MaterialParameters, LightData, LightAttenuation, GBufferData, TranslatedWorldPosition);
+
+		// Consider channel masks
+		FLATTEN
+		if ((DirectionalLightData.DirectionalLightShadowMapChannelMask >> 8) & LightingChannelMask)
+		{
+			LightSmugglePack.bHasDirectionalLight = true;
+		}
+	}
+}
+
+void AccumulateNonDirectionalLights(FMaterialPixelParameters MaterialParameters, uint LightingChannelMask, uint GridIndex, uint EyeIndex, float4 DynamicShadowFactors, float3 TranslatedWorldPosition, FGBufferData GBufferData)
+{
+	// Other Lights
+	const FCulledLightsGridData CulledLightsGrid = GetCulledLightsGrid(GridIndex, EyeIndex);
+	// Limit max to ForwardLightData.NumLocalLights.
+	// This prevents GPU hangs when the PS tries to read from uninitialized NumCulledLightsGrid buffer
+	const uint NumLightsInGridCell = min(NUM_SMUGGLED_LIGHTS, min(CulledLightsGrid.NumLocalLights, GetNumLocalLights(EyeIndex)));
+
+	// Keep count of number of lights we're smuggling
+	LightSmugglePack.NumLights = 0;
+
+	for (uint GridLightListIndex = 0; GridLightListIndex < NumLightsInGridCell; GridLightListIndex++)
+	{
+		half4 PreviewShadowMapChannelMask = 1;
+		const FLocalLightData LocalLight = GetLocalLightData(CulledLightsGrid.DataStartIndex + GridLightListIndex, EyeIndex);
+		FDeferredLightData LightData = ConvertToDeferredLight(LocalLight);
+#if USE_IES_PROFILE
+		LightData.Color *= ComputeLightProfileMultiplier(TranslatedWorldPosition, LightData.TranslatedWorldPosition, -LightData.Direction, LightData.Tangent, LightData.IESAtlasIndex);
+#endif
+		float DynamicShadowing = dot(PreviewShadowMapChannelMask, DynamicShadowFactors);
+		float4 LightAttenuation = float4(1, 1, DynamicShadowing.x, DynamicShadowing.x);
+
+		// Smuggle the light (if correct light channel)
+		uint LightTypeAndPackedShadowMapChannelMask = asuint(LocalLight.LightDirectionAndShadowMask.w);
+		FLATTEN
+		if ((LightTypeAndPackedShadowMapChannelMask >> 8) & LightingChannelMask)
+		{
+			LightSmugglePack.Lights[GridLightListIndex] = ConvertDeferredToSmuggled(MaterialParameters, LightData, LightAttenuation, GBufferData, TranslatedWorldPosition);
+			LightSmugglePack.NumLights++;
+		}
+	}
+}
+
+// NOTE: We can't just work with DeferredLightData as is, we need to do some computation first (look at AccumulateDynamicLighting)
+/// @brief	Here's where we're gonna compute everything necessary for lighting and fill out the light struct
+void SmuggleLightingData(FMaterialPixelParameters MaterialParameters, FGBufferData GBuffer, uint EyeIndex, float2 ScreenUV)
+{
+	// Params we need to get inside this function
+	uint PrimitiveId = MaterialParameters.PrimitiveId;
+	float3 TranslatedWorldPosition = MaterialParameters.WorldPosition_CamRelative;
+
+	// To be filled out, then pass it to both directional and non-directional accumulator to unpack
+	float4 DynamicShadowFactors = 1;
+
+#if MATERIALBLENDING_SOLID || MATERIALBLENDING_MASKED
+	DynamicShadowFactors = GetForwardDynamicShadowFactors(ScreenUV);
+#endif
+
+	uint LightingChannelMask = GetPrimitiveData(PrimitiveId).LightingChannelMask;
+
+	// Directional Light
+	ConvertDirectLightToSmuggled(MaterialParameters, GBuffer, LightingChannelMask, DynamicShadowFactors, EyeIndex, TranslatedWorldPosition); // dynamic shadow factors is inout
+
+	// Other Lights
+	uint GridIndex = ComputeLightGridCellIndex((uint2)((MaterialParameters.SvPosition.xy - ResolvedView.ViewRectMin.xy) * View.LightProbeSizeRatioAndInvSizeRatio.zw), MaterialParameters.SvPosition.w, EyeIndex);
+	AccumulateNonDirectionalLights(MaterialParameters, LightingChannelMask, GridIndex, EyeIndex, DynamicShadowFactors, TranslatedWorldPosition, GBuffer); // Dynamic shadow factors is inout
+}
+
+// END Engine Change

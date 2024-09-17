@@ -776,6 +776,10 @@ uint GetSelectiveOutputMask()
 }
 #endif // USES_GBUFFER
 
+// BEGIN Engine Change [LightSmuggler]: Getting our stuff in
+#include "LightSmuggler/LightSmugglerPixelShader.ush"
+// END Engine Change
+
 // is called in MainPS() from PixelShaderOutputCommon.usf
 void FPixelShaderInOut_MainPS(
 	FVertexFactoryInterpolantsVSToPS Interpolants,
@@ -823,6 +827,15 @@ void FPixelShaderInOut_MainPS(
 	}
 #endif
 
+// BEGIN Engine Change [Shading Model]: We wanna avoid running the material graph twice, so we're not gonne be running this scope just yet until AFTER getting light data so Emissive runs with everything ready.
+//									We do end up running a smaller version that just computes data we need inside of MaterialParameters for later stuff (e.g accurate screen UVs for sampling shadow map)
+#ifdef LIGHT_SMUGGLER
+	float3 Smuggler_PixelPosExcludingWPO = SvPositionToResolvedTranslatedWorld(In.SvPosition);
+	#if USE_WORLD_POSITION_EXCLUDING_SHADER_OFFSETS
+		Smuggler_PixelPosExcludingWPO = BasePassInterpolants.PixelPositionExcludingWPO;
+	#endif 
+	SetupLightSmugglerMaterialParameters(MaterialParameters, In.SvPosition, Smuggler_PixelPosExcludingWPO);
+#else 
 #if USE_WORLD_POSITION_EXCLUDING_SHADER_OFFSETS
 	{
 		float4 ScreenPosition = SvPositionToResolvedScreenPosition(In.SvPosition);
@@ -836,6 +849,8 @@ void FPixelShaderInOut_MainPS(
 		CalcMaterialParametersEx(MaterialParameters, PixelMaterialInputs, In.SvPosition, ScreenPosition, In.bIsFrontFace, TranslatedWorldPosition, TranslatedWorldPosition);
 	}
 #endif
+#endif 
+// END Engine Change
 
 #if LIGHTMAP_VT_ENABLED
 	// This must occur after CalcMaterialParameters(), which is required to initialize the VT feedback mechanism
@@ -849,6 +864,8 @@ void FPixelShaderInOut_MainPS(
 	const bool bEditorWeightedZBuffering = false;
 #endif
 
+// BEGIN Engine Change [LightSmuggler]: Due to delaying CalcMaterialParameters, PixelMatInputs is currently invalid so we can't apply this just yet, we do end up applying it later once we're ready
+#ifndef LIGHT_SMUGGLER
 #if OUTPUT_PIXEL_DEPTH_OFFSET
 	ApplyPixelDepthOffsetForBasePass(MaterialParameters, PixelMaterialInputs, BasePassInterpolants, Out.Depth);
 #endif
@@ -864,6 +881,22 @@ void FPixelShaderInOut_MainPS(
 #endif
 	}
 #endif
+#endif
+// END Engine Change
+
+// BEGIN Engine Change [LightSmuggler]: We zero everything out, mainly given that none of these mean anything yet because PixelMaterialInputs hasnt been computed + we only really use the emissive and opacity inputs
+#ifdef LIGHT_SMUGGLER
+	half3 BaseColor = 0;
+	half  Metallic = 0;
+	half  Specular = 0;
+
+	float MaterialAO = 1.f;
+	float Roughness = 1.f;
+	float Anisotropy = 0.f;
+	uint ShadingModel = SHADINGMODELID_PREINTEGRATED_SKIN; // The shading model we're hijacking
+
+	half Opacity = 1.f;
+#else // Below is the regular branch
 	// Store the results in local variables and reuse instead of calling the functions multiple times.
 	half3 BaseColor = GetMaterialBaseColor(PixelMaterialInputs);
 	half  Metallic = GetMaterialMetallic(PixelMaterialInputs);
@@ -875,6 +908,8 @@ void FPixelShaderInOut_MainPS(
 	uint ShadingModel = GetMaterialShadingModel(PixelMaterialInputs);
 
 	half Opacity = GetMaterialOpacity(PixelMaterialInputs);
+#endif
+// END Engine CHange
 
 // Opacity for this model is the coverage of the top layer over the transmission surface. Since the
 // underlying material isn't allowed to be metallic, we are scaling the metallic value by the coverage.
@@ -1038,6 +1073,60 @@ void FPixelShaderInOut_MainPS(
 		AdjustBaseColorAndSpecularColorForSubsurfaceProfileLighting(BaseColor, GBuffer.SpecularColor, Specular, bChecker);
 	}
 #endif
+
+	// BEGIN Engine Change [LightSmuggler]: Here's the meat of this whole thing. We essentially have 2 things to do here:
+	// 1. Play catch-up with everything important we've skipped earlier once we've collected light data (e.g we run the material graph *after* our lights are stored properly)
+	// 2. Make sure we don't run through any of the regular lighting routes other shading models would go through
+#ifdef LIGHT_SMUGGLER
+
+	// Zero out these values since we don't want them used here, but still need to declare them since they're used below
+	half3 DiffuseColor = 0;
+	half3 Color = 0;
+
+	// Make this output PixelMaterialInput! We need it after the fact (e.g filling GBufferDiffuseColor
+	// In the debug area at line 1427, we don't really have an "unlit" version, but we can "incorrectly" fill out the directional light only so its always lit, then set GBuffer.DiffuseColor = color, and they'll be the same
+
+	// We can fill out PrecomputedSkylight & Indirect lighting here (since those functions exist in this file)
+
+	// NOTE: This works great, but it has a dependency on CalcMaterialParameters. Not sure which parameter though or it might be LightmapVTPageTableResult? But anyways can get this working just by calling CalcMaterialParams above
+	/*
+	float3 DummySubSurface; float3 DummyDiffuseIndirect; float DummyIrradiance;;
+	const FShadingOcclusion DummyShadingOcclusion = ApplyBentNormal(MaterialParameters.CameraVector, MaterialParameters.WorldNormal, GetWorldBentNormalZero(MaterialParameters), GBuffer.Roughness, MaterialAO);
+	float3 DummyDiffuseDir = DummyShadingOcclusion.BentNormal;
+	GetPrecomputedIndirectLightingAndSkyLight(MaterialParameters, Interpolants, BasePassInterpolants, LightmapVTPageTableResult, false, DummyDiffuseDir, VolumetricLightmapBrickTextureUVs, DummyDiffuseIndirect, DummySubSurface, DummyIrradiance); //NOTE: Baked Diffuse (and indirect) from lightmass
+	int DummySingleCaptureIndex = GetPrimitiveData(MaterialParameters).SingleCaptureIndex;
+	uint DummyGridIndex = ComputeLightGridCellIndex((uint2)((MaterialParameters.SvPosition.xy - ResolvedView.ViewRectMin.xy) * View.LightProbeSizeRatioAndInvSizeRatio.zw), MaterialParameters.SvPosition.w, EyeIndex);
+	GetImageBasedReflectionLighting(MaterialParameters, 0.f, 1.f, 1.f, DummyGridIndex, DummySingleCaptureIndex, EyeIndex); //NOTE: Baked Specular from reflection probes and other stuff
+	*/
+
+	LightSmuggler_MainPS(MaterialParameters, PixelMaterialInputs, GBuffer, In.SvPosition, In.bIsFrontFace, EyeIndex, Smuggler_PixelPosExcludingWPO);
+
+	// These were zeroes out earlier, but we can fill them in now (even though half we dont enable)
+	{
+		Opacity = GetMaterialOpacity(PixelMaterialInputs);
+	}
+
+	// We skipped doing this earlier, but we can do it now that our MaterialGraphs been computed
+	{
+#if OUTPUT_PIXEL_DEPTH_OFFSET
+		ApplyPixelDepthOffsetForBasePass(MaterialParameters, PixelMaterialInputs, BasePassInterpolants, Out.Depth);
+#endif
+
+		//Clip if the blend mode requires it. We skipped this earlier as it was before we'd have access to material opacity mask
+#if !EARLY_Z_PASS_ONLY_MATERIAL_MASKING
+		if (!bEditorWeightedZBuffering)
+		{
+#if MATERIALBLENDING_MASKED_USING_COVERAGE
+			Out.Coverage = DiscardMaterialWithPixelCoverage(MaterialParameters, PixelMaterialInputs);
+#else
+			GetMaterialCoverageAndClipping(MaterialParameters, PixelMaterialInputs);
+#endif
+		}
+#endif
+	}
+
+#else // Regular stuff below
+
 	GBuffer.DiffuseColor = BaseColor - BaseColor * Metallic;
 
 #if USE_DEVELOPMENT_SHADERS
@@ -1210,6 +1299,9 @@ void FPixelShaderInOut_MainPS(
 		#endif
 	#endif
 
+#endif
+// END Engine Change
+
 	#if NEEDS_BASEPASS_VERTEX_FOGGING
 		float4 HeightFogging = BasePassInterpolants.VertexFog;
 	#elif NEEDS_BASEPASS_PIXEL_FOGGING
@@ -1273,12 +1365,14 @@ void FPixelShaderInOut_MainPS(
 	}
 #endif
 
-	#if !MATERIAL_SHADINGMODEL_UNLIT && USE_DEVELOPMENT_SHADERS
+	// BEGIN Engine Change [LightSmuggler]: We'll have to handle the unlit viewmode manually, we just export the mask value (View.UnlitViewmodeMask) or can directly access it so you just gotta do it yourself in your own shader
+	#if !MATERIAL_SHADINGMODEL_UNLIT && USE_DEVELOPMENT_SHADERS && !defined(LIGHT_SMUGGLER)
 		float3 GBufferDiffuseColor = GBuffer.DiffuseColor;
 		float3 GBufferSpecularColor = GBuffer.SpecularColor;
 		EnvBRDFApproxFullyRough(GBufferDiffuseColor, GBufferSpecularColor);
 		Color = lerp(Color, GBufferDiffuseColor, View.UnlitViewmodeMask);
 	#endif
+	// END Engine Change
 
 	half3 Emissive = GetMaterialEmissive(PixelMaterialInputs);
 

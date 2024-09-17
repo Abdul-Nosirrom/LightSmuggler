@@ -1,0 +1,29 @@
+#pragma once
+//#include "/Engine/Private/DeferredLightingCommon.ush"
+
+#define NUM_SMUGGLED_LIGHTS 5
+
+// Represents an individual light
+struct FSmuggledLight
+{
+	float3 L;
+	float3 Color;
+	float Attenuation;
+	float Shadow;
+	float SpecularScale;
+};
+
+struct FLightSmugglePacket
+{
+	uint NumLights;
+	bool bHasDirectionalLight;
+	FSmuggledLight DirectionalLight;
+	FSmuggledLight Lights[NUM_SMUGGLED_LIGHTS];
+	float SSAO;
+
+	// Utility, have to manually setup your own unlit viewmode
+	half UnlitViewmodeMask;
+};
+
+static FLightSmugglePacket LightSmugglePack;
+static uint NumSmuggledLights;

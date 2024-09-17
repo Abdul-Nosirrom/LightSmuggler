@@ -58,6 +58,12 @@
 #define MATERIAL_SHADINGMODEL_PREINTEGRATED_SKIN		0
 #endif
 
+// BEGIN Engine Change [LightSmuggler]: Setup defines choosing which shading model to hijack
+#if MATERIAL_SHADINGMODEL_PREINTEGRATED_SKIN && FORWARD_SHADING
+#define LIGHT_SMUGGLER
+#endif
+// END Engine Change
+
 #ifndef MATERIAL_SHADINGMODEL_UNLIT
 #define	MATERIAL_SHADINGMODEL_UNLIT						0
 #endif

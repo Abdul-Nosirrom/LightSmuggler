@@ -1,0 +1,85 @@
+#pragma once
+
+#include "/Engine/Private/Common.ush"
+//#include "/Engine/Private/MaterialTemplate.ush"
+//#include "/Engine/Private/LightGridCommon.ush"
+//#include "/Engine/Private/IESLightProfilesCommon.ush"
+#include "LightSmugglerCommon.ush"
+
+
+#ifdef LIGHT_SMUGGLER
+
+// This happens at around line 1315 in BasePass and returns a reflection color thats added to the final color. Maybe we can expose this to let the user decide how to apply it
+void ComputeIBL()
+{
+
+}
+
+/// @brief	Here's where we finally run our material graph, we omitted calling this during the base pass but now can call it after we've gathered lights
+void CalcMaterialParamsForLightSmugglerPass(inout FMaterialPixelParameters MaterialParameters, float4 SvPosition, bool bIsFrontFace, float3 PixelPositionExcludingWPO, inout FPixelMaterialInputs PixelMaterialInputs)
+{
+#if USE_WORLD_POSITION_EXCLUDING_SHADER_OFFSETS && !IS_NANITE_PASS
+	{
+		float4 ScreenPosition = SvPositionToResolvedScreenPosition(SvPosition);
+		float3 TranslatedWorldPosition = SvPositionToResolvedTranslatedWorld(SvPosition);
+		CalcMaterialParametersEx(MaterialParameters, PixelMaterialInputs, SvPosition, ScreenPosition, bIsFrontFace, TranslatedWorldPosition, PixelPositionExcludingWPO);
+	}
+#elif IS_NANITE_PASS
+	{
+		float3 TranslatedWorldPosition = MaterialParameters.WorldPosition_CamRelative;
+		float3 TranslatedWorldPosition_NoOffsets = MaterialParameters.WorldPosition_NoOffsets_CamRelative;
+		CalcMaterialParametersEx(MaterialParameters, PixelMaterialInputs, SvPosition, MaterialParameters.ScreenPosition, bIsFrontFace, TranslatedWorldPosition, TranslatedWorldPosition_NoOffsets);
+	}
+#else
+	{
+		CalcMaterialParameters(MaterialParameters, PixelMaterialInputs, SvPosition, bIsFrontFace);
+	}
+#endif
+}
+
+/// @brief	Alternative to CalcMaterialParameters at the start of the base pass to compute only what we need to get the lighting pass through, but without running the whole material graph
+void SetupLightSmugglerMaterialParameters(inout FMaterialPixelParameters MaterialParameters, float4 SvPosition, float3 BasePassPositionExcludingWPO)
+{
+#if USE_WORLD_POSITION_EXCLUDING_SHADER_OFFSETS
+
+		float4 ScreenPosition = SvPositionToResolvedScreenPosition(SvPosition);
+		float3 TranslatedWorldPosition = SvPositionToResolvedTranslatedWorld(SvPosition);
+		float3 TranslatedWorldPositionExcludingShaderOffsets = BasePassPositionExcludingWPO;
+#else
+
+		float4 ScreenPosition = SvPositionToResolvedScreenPosition(SvPosition);
+		float3 TranslatedWorldPosition = SvPositionToResolvedTranslatedWorld(SvPosition);
+		float3 TranslatedWorldPositionExcludingShaderOffsets = TranslatedWorldPosition;
+
+#endif
+
+	MaterialParameters.WorldPosition_CamRelative = TranslatedWorldPosition;
+	MaterialParameters.WorldPosition_NoOffsets_CamRelative = TranslatedWorldPositionExcludingShaderOffsets;
+	MaterialParameters.SvPosition = SvPosition;
+	MaterialParameters.ScreenPosition = ScreenPosition;
+}
+
+// Main goal here is wherever we can, expose data to light smuggler to let the user decide how to deal with any of this stuff)
+// Called from BasePassPixelShader.usf
+void LightSmuggler_MainPS(inout FMaterialPixelParameters MaterialParameters, inout FPixelMaterialInputs PixelMaterialInputs, inout FGBufferData GBuffer, float4 SvPosition, bool bIsFrontFace, uint EyeIndex, float3 PixelPositionExcludingWPO) // for now we're keeping it simple tho
+{
+	// NOTE: Ideally we'd do this to sample shadow masks (NearestResolvedDepthScreenUV), but screenpos.w relies on CalcMaterialParameters which doesn't exist yet, instead we pass it in originally without any depth offset adjustments
+	float2 NDC = MaterialParameters.ScreenPosition.xy / MaterialParameters.ScreenPosition.w;
+	float2 ScreenUV = NDC * ResolvedView.ScreenPositionScaleBias.xy + ResolvedView.ScreenPositionScaleBias.wz;
+	float2 NearestResolvedDepthScreenUV = CalculateNearestResolvedDepthScreenUV(ScreenUV, MaterialParameters.ScreenPosition.w); //NOTE: This is what we want sampling the shadowmap, but we have to call CalcMaterialParameters to get it....
+	LightSmugglePack.SSAO = GetIndirectOcclusion(NearestResolvedDepthScreenUV, GBuffer);
+
+	// Collect/compute all necessary light info and feed it into LightSmuggler (this should also include indirect lightign/sky light stuff)
+	SmuggleLightingData(MaterialParameters, GBuffer, EyeIndex, NearestResolvedDepthScreenUV); // This takes in "NearestResolvedDepthScreenUV"
+	// Also include IBL results...
+
+
+	// Do our lighting computation in the material graph now that the light pack is fully setup
+	// NOTE: Ensure we don't go through the BasePass computation of this, otherwise we'd essentially be running the material graph TWICE
+	LightSmugglePack.UnlitViewmodeMask = View.UnlitViewmodeMask;
+	CalcMaterialParamsForLightSmugglerPass(MaterialParameters, SvPosition, bIsFrontFace, PixelPositionExcludingWPO, PixelMaterialInputs);
+
+	// Applying decal data (we're not using roughness/specular/etc..., but we can feed those into light smuggler so the user decides what to do with them), normals though is goodie
+}
+
+#endif
